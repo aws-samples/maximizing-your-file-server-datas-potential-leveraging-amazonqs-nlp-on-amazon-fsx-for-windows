@@ -1,0 +1,600 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  This template creates an Amazon FSx for Windows File Server environment, including a VPC, 
+  subnets, an Active Directory, and an EC2 instance. It's designed for 
+  creating a prerequisite environment for the Amazon Q Connector for FSx Windows blog.
+  The template sets up a fully functional Windows file system with domain integration.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Network Configuration
+      Parameters:
+        - VPCName
+        - CIDRBlock
+        - AZCount
+    - Label:
+        default: EC2 Configuration
+      Parameters:
+        - InstanceType
+        - KeyPair
+    ParameterLabels:
+      VPCName:
+        default: VPC Name
+      CIDRBlock:
+        default: VPC CIDR Block
+      AZCount:
+        default: Number of Availability Zones
+      InstanceType:
+        default: EC2 Instance Type
+      KeyPair:
+        default: EC2 Key Pair
+
+Parameters:
+  VPCName:
+    Type: String
+    Default: 'amazonq-connector-for-win-fsx-blog'
+    Description: 'A name for this stack.'
+
+  CIDRBlock:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'The CIDR block for the VPC.'
+
+  AZCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 3
+    Description: 'Number of Availability Zones to use'
+
+  InstanceType:
+    AllowedValues:
+    - m5.large
+    Default: m5.large
+    Type: String
+    Description: 'EC2 instance type for the Windows instance'
+
+  KeyPair:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance.
+    Type: AWS::EC2::KeyPair::KeyName
+
+  LatestWindowsAmiId:
+    Description: The latest Windows Server 2016 AMI from Systems Manager Parameter Store.
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    #Default: '/aws/service/ami-windows-latest/Windows_Server-2016-English-Full-Base'
+    Default: '/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base'
+
+Conditions:
+  UseMultiAZ: !Equals [!Ref AZCount, 2]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref CIDRBlock
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-vpc'
+        - Key: Environment
+          Value: !Ref AWS::StackName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-igw'
+        - Key: Environment
+          Value: !Ref AWS::StackName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-public'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-private'
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-nat-gateway'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet0
+      Tags:
+        - Key: Name
+          Value: !Ref VPCName
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: NatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PublicSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!GetAtt VPC.CidrBlock, 256, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-public-${AWS::Region}a'
+        - Key: subnet-type
+          Value: public
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: UseMultiAZ
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!GetAtt VPC.CidrBlock, 256, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-public-${AWS::Region}b'
+        - Key: subnet-type
+          Value: public
+
+  PrivateSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [20, !Cidr [!GetAtt VPC.CidrBlock, 256, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-private-${AWS::Region}a'
+        - Key: subnet-type
+          Value: private
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: UseMultiAZ
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [21, !Cidr [!GetAtt VPC.CidrBlock, 256, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-private-${AWS::Region}b'
+        - Key: subnet-type
+          Value: private
+
+  PublicSubnet0RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet0
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: UseMultiAZ
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnet0RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet0
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: UseMultiAZ
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  DefaultSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group allowing all traffic from itself
+      SecurityGroupIngress: []  # Start with an empty ingress rule set
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: "Default security group"
+
+  SelfReferenceRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DefaultSecurityGroup.GroupId
+      IpProtocol: -1
+      FromPort: -1
+      ToPort: -1
+      SourceSecurityGroupId: !GetAtt DefaultSecurityGroup.GroupId
+
+  Directory:
+    Type: AWS::DirectoryService::MicrosoftAD
+    Properties:
+      Edition: Enterprise
+      Name: example.com
+      Password: !Join ['', ['{{resolve:secretsmanager:', !Ref Password, ':SecretString:password}}' ]]
+      VpcSettings:
+        SubnetIds:
+          - !Ref PrivateSubnet0
+          - !If [UseMultiAZ, !Ref PrivateSubnet1, !Ref PrivateSubnet0]
+        VpcId: !Ref VPC
+        
+
+  Password:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: QBusiness-fsx-creds
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "admin@example.com"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-ad-admin-secret'
+        - Key: Environment
+          Value: !Ref AWS::StackName
+
+  DhcpOptions:
+    Type: AWS::EC2::DHCPOptions
+    Properties:
+      DomainName: example.com
+      DomainNameServers: !GetAtt Directory.DnsIpAddresses
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-dhcp-options'
+        - Key: Environment
+          Value: !Ref AWS::StackName
+
+  DhcpOptionsAssociation:
+    Type: AWS::EC2::VPCDHCPOptionsAssociation
+    Properties:
+      DhcpOptionsId: !Ref DhcpOptions
+      VpcId: !Ref VPC
+
+  WindowsFileSystem:
+    Type: AWS::FSx::FileSystem
+    Properties:
+      FileSystemType: WINDOWS
+      StorageCapacity: 32
+      StorageType: SSD
+      SubnetIds:
+        - !Ref PrivateSubnet0
+        - !If [UseMultiAZ, !Ref PrivateSubnet1, !Ref PrivateSubnet0]
+      SecurityGroupIds:
+        - !Ref DefaultSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${VPCName}-fsx-windows'
+        - Key: Environment
+          Value: !Ref AWS::StackName
+      WindowsConfiguration:
+        ActiveDirectoryId: !Ref Directory
+        ThroughputCapacity: 1024
+        DeploymentType: MULTI_AZ_1
+        PreferredSubnetId: !Ref PrivateSubnet0
+
+  Instance0:
+    Type: AWS::EC2::Instance
+    DependsOn: [WindowsFileSystem, DefaultSecurityGroup, InstanceProfile]
+    Properties:
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Ref LatestWindowsAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPair
+      Monitoring: true
+      SecurityGroupIds:
+        - !Ref DefaultSecurityGroup
+      SubnetId: !Ref PrivateSubnet0
+      Tags:
+        - Key: Name
+          Value: FSx/W Windows Instance
+        - Key: Environment
+          Value: !Ref AWS::StackName
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          # Force TLS 1.2
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          # Allow outbound connections for PowerShell and Package Management
+          New-NetFirewallRule -DisplayName "Allow PowerShell Outbound" -Direction Outbound -Program "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -Action Allow
+          New-NetFirewallRule -DisplayName "Allow Package Management Outbound" -Direction Outbound -Program "%SystemRoot%\System32\PackageManagement\PkgMgr.exe" -Action Allow
+
+          # Configure TLS 1.2 and set up NuGet package source
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Register-PackageSource -Provider NuGet -Name nugetRepository -Location https://www.nuget.org/api/v2 -Force
+
+          # Install required Windows features and PowerShell modules
+          Install-WindowsFeature AD-Domain-Services -IncludeManagementTools
+          Install-Module -Name AWS.Tools.IdentityManagement, AWS.Tools.SecretsManager -Force -AllowClobber
+          Install-Module -Name AWSPowerShell -Force
+
+          # Import logging module
+          Import-Module Microsoft.PowerShell.Management
+
+          # Install Git
+          $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.33.0.windows.2/Git-2.33.0.2-64-bit.exe"
+          $outputPath = "$env:TEMP\GitInstaller.exe"
+          try {
+              $webClient = New-Object System.Net.WebClient
+              $webClient.DownloadFile($gitUrl, $outputPath)
+          }
+          catch {
+              Write-Output "Failed to download Git installer: $_"
+              exit 1
+          }
+          if (Test-Path $outputPath) {
+              try {
+                  $process = Start-Process -FilePath $outputPath -ArgumentList "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/COMPONENTS=icons,ext\reg\shellhere,assoc,assoc_sh" -PassThru -Wait
+                  if ($process.ExitCode -ne 0) {
+                      throw "Git installer exited with code $($process.ExitCode)"
+                  }
+              }
+              catch {
+                  Write-Output "Failed to install Git: $_"
+                  exit 1
+              }
+              Remove-Item $outputPath -ErrorAction SilentlyContinue
+          }
+          else {
+              Write-Output "Git installer not found at $outputPath"
+              exit 1
+          }
+          $gitPath = "C:\Program Files\Git\cmd"
+          $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+          if ($currentPath -notlike "*$gitPath*") {
+              [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$gitPath", "Machine")
+          }
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          try {
+              $gitVersion = & git --version
+              Write-Output "Git installed successfully: $gitVersion"
+          }
+          catch {
+              Write-Output "Failed to verify Git installation: $_"
+              exit 1
+          }
+          </powershell>
+
+  FSxDomainJoinInstallDFS:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Content:
+        schemaVersion: "2.2"
+        description: Join instances to an AWS Directory Service domain
+        parameters:
+          directoryId:
+            type: String
+            description: (Required) ID of the AWS Managed Microsoft AD (i.e. d-0123456789)
+          directoryName:
+            type: String
+            description: (Required) Directory name (i.e. example.com)
+          dnsIpAddresses:
+            type: StringList
+            default: []
+            description: "(Optional) AWS Managed Microsoft AD DNS IP addresses"
+        mainSteps:
+        - action: aws:domainJoin
+          name: joinDomain
+          inputs:
+            directoryId: "{{ directoryId }}"
+            directoryName: "{{ directoryName }}"
+            dnsIpAddresses: "{{ dnsIpAddresses }}"
+        - action: aws:runPowerShellScript
+          name: installDfsMgmt
+          inputs:
+            runCommand:
+              - Install-WindowsFeature -Name FS-FileServer, FS-DFS-namespace -IncludeManagementTools;
+              - Install-WindowsFeature -Name RSAT-DFS-Mgmt-Con
+              - New-Item -Type Directory -Path "C:\DFS"
+
+  Association:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref FSxDomainJoinInstallDFS
+      Parameters:
+        directoryId: [!Ref Directory]
+        directoryName: [!GetAtt ActiveDirectory.Name]
+        dnsIpAddresses:
+        - !Select [ 0, !GetAtt ActiveDirectory.DnsIpAddrs ]
+        - !Select [ 1, !GetAtt ActiveDirectory.DnsIpAddrs ]
+      Targets:
+      - Key: InstanceIds
+        Values: [ !Ref Instance0 ]
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/'
+      Roles:
+      - !Ref InstanceRole
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      - arn:aws:iam::aws:policy/AmazonFSxReadOnlyAccess
+      Path: "/"
+      Policies:
+      - PolicyName: secretsmanager
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            - secretsmanager:DescribeSecret
+            - secretsmanager:ListSecretVersionIds
+            Resource: arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSLambdaExecute'
+        - 'arn:aws:iam::aws:policy/AWSDirectoryServiceReadOnlyAccess'
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            #Resource: arn:aws:logs:*:*:*
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Effect: Allow
+            Action:
+            - ec2:DescribeImages
+            Resource: "*"
+
+  ActiveDirectoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub solution-references-${AWS::Region}
+        S3Key: fsx/dfs/ActiveDirectoryCustomResource.zip
+      Handler: ad.handler
+      Runtime: nodejs20.x
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  ActiveDirectory:
+    Type: Custom::ActiveDirectory
+    Properties:
+      ServiceToken: !GetAtt ActiveDirectoryFunction.Arn
+      Region: !Ref 'AWS::Region'
+      ID: !Ref Directory
+
+Outputs:
+  VPCId:
+    Description: 'ID of the VPC created for the FSx environment'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  PublicSubnet0Id:
+    Description: 'ID of the first public subnet in Availability Zone 1'
+    Value: !Ref PublicSubnet0
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet0Id'
+
+  PublicSubnet1Id:
+    Condition: UseMultiAZ
+    Description: 'ID of the second public subnet in Availability Zone 2 (if multi-AZ)'
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1Id'
+
+  PrivateSubnet0Id:
+    Description: 'ID of the first private subnet in Availability Zone 1'
+    Value: !Ref PrivateSubnet0
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet0Id'
+
+  PrivateSubnet1Id:
+    Condition: UseMultiAZ
+    Description: 'ID of the second private subnet in Availability Zone 2 (if multi-AZ)'
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+
+  WindowsInstanceId:
+    Description: 'ID of the Windows EC2 instance created in the environment'
+    Value: !Ref Instance0
+    Export:
+      Name: !Sub '${AWS::StackName}-WindowsInstanceId'
+
+  FileSystemId:
+    Description: 'ID of the FSx for Windows File System created in the environment'
+    Value: !Ref WindowsFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-FileSystemId'
+
+  ActiveDirectoryId:
+    Description: 'ID of the AWS Managed Microsoft AD created for the FSx environment'
+    Value: !Ref Directory
+    Export:
+      Name: !Sub '${AWS::StackName}-ActiveDirectoryId'
+
+  DefaultSecurityGroupId:
+    Description: 'ID of the default Security Group for EC2 instances'
+    Value: !Ref DefaultSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DefaultSecurityGroupId'
+
+  InstanceRoleArn:
+    Description: 'ARN of the IAM Role associated with the EC2 instance'
+    Value: !GetAtt InstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceRoleArn'
